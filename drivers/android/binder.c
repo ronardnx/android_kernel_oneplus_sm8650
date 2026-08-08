@@ -3239,6 +3239,93 @@ static void binder_transaction(struct binder_proc *proc,
 	binder_set_extended_error(&thread->ee, t_debug_id, BR_OK, 0);
 	binder_inner_proc_unlock(proc);
 
+#ifdef CONFIG_KSU_SUSFS
+	/*
+	 * ROD Binder Service Filter v2 (Stability Focused):
+	 * Intercept transactions to and from ServiceManager.
+	 * Only apply spoofing to user apps (UID >= 10000) and EXCLUDE critical system
+	 * processes (system_server, systemui, surfaceflinger) to prevent bootloops.
+	 */
+	if (tr && target_proc) {
+		bool is_to_sm = (!reply && tr->target.handle == 0); // Handle 0 is Context Manager
+		bool is_from_sm = (reply && in_reply_to && in_reply_to->buffer &&
+			in_reply_to->buffer->target_node &&
+			in_reply_to->buffer->target_node == in_reply_to->buffer->target_node->proc->context->binder_context_mgr_node);
+
+		if (is_to_sm || is_from_sm) {
+			uid_t app_uid = is_to_sm ? current_uid().val : task_uid(target_proc->tsk).val;
+			struct task_struct *app_tsk = is_to_sm ? current : target_proc->tsk;
+			
+			if (app_uid >= 10000 && app_tsk) {
+				// Exclude any process containing critical system keywords
+				bool is_system = (strstr(app_tsk->comm, "sys") != NULL ||
+				                  strstr(app_tsk->comm, "android") != NULL ||
+				                  strstr(app_tsk->comm, "lineage") != NULL ||
+				                  strstr(app_tsk->comm, "surface") != NULL ||
+				                  strstr(app_tsk->comm, "zygote") != NULL);
+				                  
+				// Apply spoofing ONLY to 3rd party apps (like Duck Detector)
+				if (!is_system) {
+					size_t data_size = tr->data_size;
+					if (data_size > 0 && data_size <= 65536) {
+						char *user_buf = (char __user *)(uintptr_t)tr->data.ptr.buffer;
+						char *kbuf = kmalloc(data_size, GFP_KERNEL);
+						if (kbuf && !copy_from_user(kbuf, user_buf, data_size)) {
+							
+							struct string_pair {
+								const u8 *needle;
+								const u8 *replace;
+								size_t len;
+							};
+							
+							/* UTF-16LE strings to spoof */
+							static const u8 n_lineage[] = { 'l',0,'i',0,'n',0,'e',0,'a',0,'g',0,'e',0 };
+							static const u8 r_lineage[] = { 'a',0,'n',0,'d',0,'r',0,'o',0,'i',0,'d',0 };
+							
+							static const u8 n_profile[] = { 'p',0,'r',0,'o',0,'f',0,'i',0,'l',0,'e',0 };
+							static const u8 r_profile[] = { 'p',0,'r',0,'o',0,'f',0,'i',0,'l',0,'d',0 };
+							
+							static const u8 n_livedisp[] = { 'l',0,'i',0,'v',0,'e',0,'d',0,'i',0,'s',0,'p',0,'l',0,'a',0,'y',0 };
+							static const u8 r_livedisp[] = { 'l',0,'o',0,'v',0,'e',0,'d',0,'i',0,'s',0,'p',0,'l',0,'a',0,'y',0 };
+							
+							static const u8 n_trust[] = { 't',0,'r',0,'u',0,'s',0,'t',0 };
+							static const u8 r_trust[] = { 'c',0,'r',0,'u',0,'s',0,'t',0 };
+
+							struct string_pair pairs[] = {
+								{ n_lineage, r_lineage, sizeof(n_lineage) },
+								{ n_profile, r_profile, sizeof(n_profile) },
+								{ n_livedisp, r_livedisp, sizeof(n_livedisp) },
+								{ n_trust, r_trust, sizeof(n_trust) }
+							};
+
+							bool modified = false;
+							size_t i, p;
+
+							for (p = 0; p < sizeof(pairs) / sizeof(pairs[0]); p++) {
+								for (i = 0; i + pairs[p].len <= data_size; i += 2) {
+									if (memcmp(kbuf + i, pairs[p].needle, pairs[p].len) == 0) {
+										memcpy(kbuf + i, pairs[p].replace, pairs[p].len);
+										modified = true;
+									}
+								}
+							}
+							
+							// If we changed anything, we write it back to the user buffer 
+							// BEFORE it gets copied to the target's binder buffer!
+							if (modified) {
+								if (copy_to_user(user_buf, kbuf, data_size)) {
+									// Silences the warn_unused_result attribute.
+								}
+							}
+						}
+						if (kbuf) kfree(kbuf);
+					}
+				}
+			}
+		}
+	}
+#endif
+
 	if (reply) {
 		binder_inner_proc_lock(proc);
 		in_reply_to = thread->transaction_stack;
